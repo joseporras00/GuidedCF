@@ -1,0 +1,159 @@
+import numpy as np
+import tensorflow as tf
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.utils import to_categorical
+from keras_preprocessing.sequence import pad_sequences
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
+from tensorflow.keras.callbacks import EarlyStopping
+from tensorflow.keras.layers import *
+from tensorflow.keras.models import Model, Sequential
+from utils import create_sequences3
+
+# Early stopping
+es = EarlyStopping(monitor='val_loss', verbose=1, patience=10, mode='min', restore_best_weights=True)
+
+# Load data
+X, y = create_sequences3('combined_preprocessed_data')
+
+# Padding and scaling
+sz = 90
+special_value = -10.0
+X = pad_sequences(X, maxlen=sz, dtype='float', padding='post', truncating='post', value=special_value)
+
+# Encode y for binary classification
+label_encoder = LabelEncoder()
+y = label_encoder.fit_transform(y)
+
+def calculate_class_weights(y_train):
+    class_weights = compute_class_weight(class_weight='balanced', classes=np.unique(y_train), y=y_train)
+    return {i: weight for i, weight in enumerate(class_weights)}
+
+# Define model architectures (ResNet, LSTM, BiLSTM, Conv1D, ConvLSTM)
+def residual_block(x, filters, kernel_size=3, stride=1):
+    shortcut = x
+    x = Conv1D(filters, kernel_size, strides=stride, padding='same')(x)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = Conv1D(filters, kernel_size, strides=1, padding='same')(x)
+    x = BatchNormalization()(x)
+    if x.shape[-1] != shortcut.shape[-1]:
+        shortcut = Conv1D(filters, kernel_size=1, strides=stride, padding='same')(shortcut)
+        shortcut = BatchNormalization()(shortcut)
+    x = Add()([x, shortcut])
+    x = Activation('relu')(x)
+    return x
+
+def create_resnet_model(input_shape):
+    inputs = Input(shape=input_shape)
+    x = Conv1D(64, 7, strides=2, padding='same')(inputs)
+    x = BatchNormalization()(x)
+    x = Activation('relu')(x)
+    x = MaxPooling1D(3, strides=2, padding='same')(x)
+    for filters in [64, 128, 256, 512]:
+        x = residual_block(x, filters)
+    x = GlobalAveragePooling1D()(x)
+    x = Dense(1, activation='sigmoid')(x)
+    model = Model(inputs, x)
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def create_lstm_model(input_shape):
+    model = Sequential()
+    model.add(LSTM(128, return_sequences=True, input_shape=input_shape))
+    model.add(LSTM(64))
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def create_bilstm_model(input_shape):
+    model = Sequential()
+    model.add(Bidirectional(LSTM(128, return_sequences=True), input_shape=input_shape))
+    model.add(Bidirectional(LSTM(64)))
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def create_conv1d_model(input_shape):
+    model = Sequential()
+    model.add(Conv1D(128, kernel_size=3, activation='relu', input_shape=input_shape))
+    model.add(MaxPooling1D(pool_size=2))
+    model.add(Conv1D(256, kernel_size=3, activation='relu'))
+    model.add(MaxPooling1D(pool_size=2))
+    model.add(Flatten())
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+def create_convlstm_model(input_shape):
+    model = Sequential()
+    # Ajustar input_shape a 5D: (time_steps, rows, cols, channels)
+    model.add(ConvLSTM2D(filters=128, kernel_size=(4, 7), activation='relu', input_shape=input_shape))
+    model.add(Flatten())
+    model.add(Dense(1, activation='sigmoid'))
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+# K-Fold Cross-Validation and Model Evaluation
+kfold = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# Function to evaluate each model using k-fold cross-validation
+def cross_validate_model(create_model_fn, X, y):
+    accuracies, roc_aucs, f1_scores = [], [], []
+
+    for train_idx, val_idx in kfold.split(X, y):
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        # Calculate class weights
+        class_weights = calculate_class_weights(y_train)
+
+        # Create the model
+        input_shape = X_train.shape[1:]  # Adjusted input shape for each model
+        model = create_model_fn(input_shape)
+
+        # Train the model
+        model.fit(X_train, y_train, epochs=100, batch_size=8, validation_data=(X_val, y_val),
+                  class_weight=class_weights, verbose=0, callbacks=[es])
+
+        # Predict and evaluate
+        y_pred_prob = model.predict(X_val)
+        y_pred = (y_pred_prob > 0.5).astype(int)
+
+        accuracy = accuracy_score(y_val, y_pred)
+        roc_auc = roc_auc_score(y_val, y_pred_prob)
+        f1 = f1_score(y_val, y_pred)
+
+        accuracies.append(accuracy)
+        roc_aucs.append(roc_auc)
+        f1_scores.append(f1)
+
+    return np.mean(accuracies), np.mean(roc_aucs), np.mean(f1_scores)
+
+# Preprocess data for ConvLSTM model (5D input shape required)
+# Expand dimensions for ConvLSTM: (samples, time_steps, rows, cols, channels)
+X_convlstm = np.expand_dims(np.expand_dims(X, axis=1), axis=-1)
+
+# Cross-validate models
+print("Evaluating ResNet model...")
+resnet_acc, resnet_roc_auc, resnet_f1 = cross_validate_model(create_resnet_model, X, y)
+
+print("Evaluating LSTM model...")
+lstm_acc, lstm_roc_auc, lstm_f1 = cross_validate_model(create_lstm_model, X, y)
+
+print("Evaluating BiLSTM model...")
+bilstm_acc, bilstm_roc_auc, bilstm_f1 = cross_validate_model(create_bilstm_model, X, y)
+
+print("Evaluating Conv1D model...")
+conv1d_acc, conv1d_roc_auc, conv1d_f1 = cross_validate_model(create_conv1d_model, X, y)
+
+print("Evaluating ConvLSTM model...")
+convlstm_acc, convlstm_roc_auc, convlstm_f1 = cross_validate_model(create_convlstm_model, X_convlstm, y)
+
+# Print results for each model
+print(f"ResNet Model: Accuracy = {resnet_acc}, ROC AUC = {resnet_roc_auc}, F1 Score = {resnet_f1}")
+print(f"LSTM Model: Accuracy = {lstm_acc}, ROC AUC = {lstm_roc_auc}, F1 Score = {lstm_f1}")
+print(f"BiLSTM Model: Accuracy = {bilstm_acc}, ROC AUC = {bilstm_roc_auc}, F1 Score = {bilstm_f1}")
+print(f"Conv1D Model: Accuracy = {conv1d_acc}, ROC AUC = {conv1d_roc_auc}, F1 Score = {conv1d_f1}")
+print(f"ConvLSTM Model: Accuracy = {convlstm_acc}, ROC AUC = {convlstm_roc_auc}, F1 Score = {convlstm_f1}")
